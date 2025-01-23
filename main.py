@@ -229,6 +229,7 @@ class TrainingArguments(TrainingArgumentsBase):
         default=None,
         metadata={"help": "The path to a folder with a valid checkpoint for your model."},
     )
+
     def __post_init__(self):
         super().__post_init__()
         assert self.per_device_train_batch_size % 2 == 0, "per_device_train_batch_size must be divisible by 2"
@@ -269,6 +270,7 @@ class DataTrainingArguments:
         default="data/csts_test.csv",
         metadata={"help": "A csv or a json file containing the test data."},
     )
+
     def __post_init__(self):
         if self.max_train_samples == 999:
             self.max_train_samples = None
@@ -311,6 +313,7 @@ class TokenizerAndModelArguments:
     tuner_pool_type: dict = field(
         default_factory=lambda: {'type':'categorical', 'choices':['cls', 'avg', 'avg_top2', 'avg_first_last']},
     )
+
     def __post_init__(self):
         assert self.pool_type in ['cls', 'avg', 'avg_top2', 'avg_first_last'], "pool_type must be in ['cls', 'avg', 'avg_top2', 'avg_first_last']"
 
@@ -860,7 +863,7 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
         # update params
         update_params = {key.replace('tuner_',''):value
                          for key,value in tokenizer_model_dict.items() if key.startswith('tuner_')}
-        update_params = modify_dict_with_trial(update_params, trial)
+        update_params = modify_dict_with_trial(update_params, trial) # trial.suggest_xxx
         logger.info(f"Trial Model: {update_params}")
 
         # update config_cp
@@ -902,17 +905,37 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
 
         # set hp_space_hook to initial trial callback each trial
         def hp_space_hook(trial: Union[optuna.trial.Trial,optuna.trial.FrozenTrial]):
+            # set pruner callback for optuna
             callback_str_list: List[str] = trainer.callback_handler.callback_list.split('\n')
             current_module = sys.modules[__name__]
             trial_callback_class = getattr(current_module, "PruningCallback")
             if str_if_contain_in_str_list('PruningCallback', callback_str_list, mode='contained'):
                 trainer.callback_handler.remove_callback(trial_callback_class)
             trainer.add_callback(trial_callback_class(trial, monitor=training_args.metric_for_best_model))
+
+            # tuner model hyperparameters hook for trial
+            # and in model_init func, trial will suggest the same hyperparameters
+            # but we do not need to return model hyperparameters (because it will cause errors.)
+            # update params
+            update_params = {key.replace('tuner_', ''): value
+                             for key, value in tokenizer_model_dict.items() if key.startswith('tuner_')}
+            update_params = modify_dict_with_trial(update_params, trial)  # trial.suggest_xxx
             return dict()
+
         # set hp search
+        # set url_path
         if not os.path.exists(training_args.tuner_results_dir):
             os.makedirs(training_args.tuner_results_dir)
-        url_path = "sqlite:///" + os.path.join(training_args.tuner_results_dir, "tuner.db")
+        url_obj = os.path.join(training_args.tuner_results_dir, "tuner.db")
+        url_path = "sqlite:///" + url_obj
+        # create study in rank 0
+        if not os.path.exists(url_obj):
+            with training_args.main_process_first(local=False, desc='create study'):
+                study = optuna.create_study(
+                    storage=optuna.storages.RDBStorage(
+                        url_path
+                    )
+                )
         best_trial = trainer.hyperparameter_search(
             #hp_space=lambda trial: dict(),
             hp_space=hp_space_hook,
@@ -921,13 +944,13 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
             direction="minimize" if training_args.metric_for_best_model.endswith('loss') else "maximize",
             backend='optuna',
             study_name='CSTS',
-            # storage=optuna.storages.RDBStorage(
-            #     url_path,
-            #     heartbeat_interval=60,
-            #     grace_period=120,
-            #     failed_trial_callback=optuna.storages.RetryFailedTrialCallback(3),
-            # ),
-            # load_if_exists=True,
+            storage=optuna.storages.RDBStorage(
+                url_path,
+                heartbeat_interval=60,
+                grace_period=120,
+                failed_trial_callback=optuna.storages.RetryFailedTrialCallback(3),
+            ),
+            load_if_exists=True,
             sampler=optuna.samplers.TPESampler(),
             gc_after_trial=True,
             pruner=CombinePruner([
@@ -936,6 +959,7 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
             ])
             # pruner=optuna.pruners.NopPruner(),
         )
+
         # log hyperparameters
         best_params = best_trial.hyperparameters
         logger.info(f"Best Params: {best_params}")
