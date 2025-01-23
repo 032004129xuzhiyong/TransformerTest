@@ -784,6 +784,7 @@ def modify_dict_with_trial(args, trial:Union[optuna.trial.Trial,optuna.trial.Fro
         value = args[key]
         if isinstance(value, dict):
             if 'type' in value.keys(): # need modified
+                print(value)
                 cls = value['type']
                 value.pop('type')
                 if cls == 'int': # low high step log
