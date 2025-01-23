@@ -41,7 +41,6 @@ from transformers import (
     DataCollatorWithPadding,
     default_data_collator,
 )
-from trl import SFTTrainer, SFTConfig
 
 # logging
 logging.set_verbosity_info()
