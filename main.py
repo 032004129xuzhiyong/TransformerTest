@@ -41,6 +41,7 @@ from transformers import (
     DataCollatorWithPadding,
     default_data_collator,
 )
+from trl import SFTTrainer, SFTConfig
 
 # logging
 logging.set_verbosity_info()
@@ -234,7 +235,6 @@ class TrainingArguments(TrainingArgumentsBase):
         assert self.per_device_train_batch_size % 2 == 0, "per_device_train_batch_size must be divisible by 2"
         assert self.per_device_eval_batch_size % 2 == 0, "per_device_eval_batch_size must be divisible by 2"
         assert self.eval_steps == self.save_steps == self.logging_steps, "eval_steps, save_steps, logging_steps must be the same"
-
 
 @dataclass
 class DataTrainingArguments:
@@ -922,13 +922,13 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
             direction="minimize" if training_args.metric_for_best_model.endswith('loss') else "maximize",
             backend='optuna',
             study_name='CSTS',
-            storage=optuna.storages.RDBStorage(
-                url_path,
-                heartbeat_interval=60,
-                grace_period=120,
-                failed_trial_callback=optuna.storages.RetryFailedTrialCallback(3),
-            ),
-            load_if_exists=True,
+            # storage=optuna.storages.RDBStorage(
+            #     url_path,
+            #     heartbeat_interval=60,
+            #     grace_period=120,
+            #     failed_trial_callback=optuna.storages.RetryFailedTrialCallback(3),
+            # ),
+            # load_if_exists=True,
             sampler=optuna.samplers.TPESampler(),
             gc_after_trial=True,
             pruner=CombinePruner([
