@@ -784,12 +784,12 @@ def modify_dict_with_trial(args, trial:Union[optuna.trial.Trial,optuna.trial.Fro
         value = args[key]
         if isinstance(value, dict):
             if 'type' in value.keys(): # need modified
-                print(value)
                 cls = value['type']
                 value.pop('type')
                 if cls == 'int': # low high step log
                     args[key] = trial.suggest_int(key,**value)
                 elif cls == 'float': # low high step log
+                    print(key, value, type(trial))
                     args[key] = trial.suggest_float(key,**value)
                 elif cls == 'discrete_uniform': # low high q
                     args[key] = trial.suggest_discrete_uniform(key,**value)
