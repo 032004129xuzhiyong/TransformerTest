@@ -107,8 +107,8 @@ class TrainingArguments(TrainingArgumentsBase):
         default=None, metadata={"help": "The list of keys in your dictionary of inputs that correspond to the labels."}
     )
     num_train_epochs: float = field(default=3)
-    per_device_train_batch_size: int = field(default=16)
-    per_device_eval_batch_size: int = field(default=16)
+    per_device_train_batch_size: int = field(default=8)
+    per_device_eval_batch_size: int = field(default=8)
     dataloader_prefetch_factor: Optional[int] = field(
         default=1,
         metadata={
@@ -208,14 +208,14 @@ class TrainingArguments(TrainingArgumentsBase):
     
     # tuner setup
     tuner: bool = field(
-        default=False,
+        default=True,
         metadata={
             'help': "Use optuna tuner or not."
             "default hyperparameter search setup must add tuner_xxx"
         }
     )
     n_trials: int = field(
-        default=5,
+        default=2,
         metadata={
             'help': "Number of trials to run."
         }
@@ -229,19 +229,25 @@ class TrainingArguments(TrainingArgumentsBase):
         default=None,
         metadata={"help": "The path to a folder with a valid checkpoint for your model."},
     )
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.per_device_train_batch_size % 2 == 0, "per_device_train_batch_size must be divisible by 2"
+        assert self.per_device_eval_batch_size % 2 == 0, "per_device_eval_batch_size must be divisible by 2"
+        assert self.eval_steps == self.save_steps == self.logging_steps, "eval_steps, save_steps, logging_steps must be the same"
+
 
 @dataclass
 class DataTrainingArguments:
     max_seq_length: int = field(default=512)
     padding: str = field(default='longest', metadata={"help": "The padding strategy to use.(longest/max_length)"})
     max_train_samples: Optional[int] = field(
-        default=None,
+        default=16,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
         },
     )
     max_eval_samples: Optional[int] = field(
-        default=None,
+        default=16,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
         },
@@ -264,6 +270,13 @@ class DataTrainingArguments:
         default="data/csts_test.csv",
         metadata={"help": "A csv or a json file containing the test data."},
     )
+    def __post_init__(self):
+        if self.max_train_samples == 999:
+            self.max_train_samples = None
+        if self.max_eval_samples == 999:
+            self.max_eval_samples = None
+        if self.max_predict_samples == 999:
+            self.max_predict_samples = None
 
 @dataclass
 class TokenizerAndModelArguments:
@@ -299,6 +312,8 @@ class TokenizerAndModelArguments:
     tuner_pool_type: dict = field(
         default_factory=lambda: {'type':'categorical', 'choices':['cls', 'avg', 'avg_top2', 'avg_first_last']},
     )
+    def __post_init__(self):
+        assert self.pool_type in ['cls', 'avg', 'avg_top2', 'avg_first_last'], "pool_type must be in ['cls', 'avg', 'avg_top2', 'avg_first_last']"
 
 # dataset
 def str_if_contain_in_str_list(one_str:str, str_list:Iterable[str], mode:str='contain'):
@@ -789,7 +804,6 @@ def modify_dict_with_trial(args, trial:Union[optuna.trial.Trial,optuna.trial.Fro
                 if cls == 'int': # low high step log
                     args[key] = trial.suggest_int(key,**value)
                 elif cls == 'float': # low high step log
-                    print(key, value, type(trial))
                     args[key] = trial.suggest_float(key,**value)
                 elif cls == 'discrete_uniform': # low high q
                     args[key] = trial.suggest_discrete_uniform(key,**value)
@@ -930,8 +944,7 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
         # use best config to run best result
         run_tokenizer_model_args = copy.deepcopy(tokenizer_model_args)
         for key in best_params.keys():
-            if key.startswith('tuner_'):
-                run_tokenizer_model_args.__setattr__(key, best_params[key])
+            run_tokenizer_model_args.__setattr__(key, best_params[key])
         run_data_args = copy.deepcopy(data_args)
         run_training_args = copy.deepcopy(training_args)
         run_training_args.do_train = True
