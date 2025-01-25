@@ -208,7 +208,7 @@ class TrainingArguments(TrainingArgumentsBase):
     
     # tuner setup
     tuner: bool = field(
-        default=True,
+        default=False,
         metadata={
             'help': "Use optuna tuner or not."
             "default hyperparameter search setup must add tuner_xxx"
@@ -517,7 +517,8 @@ def load_datasets_func(data_args:DataTrainingArguments,
     label_unique = raw_datasets.unique('label')
     all_labels = set(label_unique['train'] + label_unique['validation'])
     scale = (min(all_labels), max(all_labels))
-    with training_args.main_process_first(desc='dataset map pre-processing'):
+
+    with training_args.main_process_first(local=True, desc='dataset map pre-processing'):
         sort_datasets = raw_datasets.sort(['sentence1', 'label'], reverse=[False, True])
         if training_args.do_train:
             train_dataset = sort_datasets.pop('train')
@@ -525,7 +526,7 @@ def load_datasets_func(data_args:DataTrainingArguments,
             unbatch_train_dataset = batch_train_dataset.map(unbatch, batched=True)
             sort_datasets['train'] = unbatch_train_dataset
         trans_datasets = sort_datasets.map(
-            preprocess_func, 
+            preprocess_func,
             batched=True,
             remove_columns=raw_datasets['validation'].column_names,
             fn_kwargs={'tokenizer': tokenizer,
@@ -557,6 +558,7 @@ def load_datasets_func(data_args:DataTrainingArguments,
             else:
                 select_trans_datasets['test'] = trans_datasets['test']
         select_trans_datasets = DatasetDict(select_trans_datasets)
+
     return select_trans_datasets
 
 # model
@@ -732,15 +734,25 @@ class PruningCallback(TrainerCallback):
             self.trial.report(logs[self.monitor], state.global_step)
 
     def on_epoch_end(self, args, state, control, logs=None, **kwargs):
-        if self.trial.should_prune():
-            raise optuna.TrialPruned()
+        if state.is_world_process_zero:
+            if_pruned = self.trial.should_prune()
+            if args.world_size > 1: # distributed training
+                if_pruned_list = [if_pruned]
+                torch.distributed.broadcast_object_list(if_pruned_list, src=0)
+            if if_pruned:
+                raise optuna.TrialPruned()
+        else:
+            if_pruned_list = [False]
+            torch.distributed.broadcast_object_list(if_pruned_list, src=0)
+            if if_pruned_list[0]:
+                raise optuna.TrialPruned()
+                #control.should_training_stop = True
 
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         log_history: List[Dict[str, float]] = state.log_history
         eval_log_history: List[Dict[str, float]] = []
         for log in log_history:
             if str_if_contain_in_str_list('eval_', log.keys(), mode='contained'):
-                eval_log_history.append(log)
                 eval_log_history.append(log)
         self.trial.set_user_attr('epoch_history', pd.DataFrame(eval_log_history).to_dict('list'))
 
@@ -924,17 +936,20 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
 
         # set hp search
         # set url_path
-        if not os.path.exists(training_args.tuner_results_dir):
-            os.makedirs(training_args.tuner_results_dir)
+
+        with training_args.main_process_first(local=True, desc='create tuner_results_dir'):
+            if not os.path.exists(training_args.tuner_results_dir):
+                os.makedirs(training_args.tuner_results_dir)
         url_obj = os.path.join(training_args.tuner_results_dir, "tuner.db")
         url_path = "sqlite:///" + url_obj
         # create study in rank 0
-        if not os.path.exists(url_obj):
-            with training_args.main_process_first(local=False, desc='create study'):
-                study = optuna.create_study(
+        with training_args.main_process_first(local=True, desc='create study'):
+            if not os.path.exists(url_obj):
+                _ = optuna.create_study(
                     storage=optuna.storages.RDBStorage(
-                        url_path
-                    )
+                        url_path,
+                    ),
+                    study_name='CSTS',
                 )
         best_trial = trainer.hyperparameter_search(
             #hp_space=lambda trial: dict(),
@@ -961,13 +976,23 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
         )
 
         # log hyperparameters
-        best_params = best_trial.hyperparameters
-        logger.info(f"Best Params: {best_params}")
-        
+        if training_args.process_index == 0:
+            best_params = best_trial.hyperparameters
+            logger.info(f"Best Params: {best_params}")
+            # distribute best_params to all processes
+            # because non-main processes will return None
+            if training_args.world_size > 1:
+                best_params_list = [best_params]
+                torch.distributed.broadcast_object_list(best_params_list, src=0)
+        else:
+            best_params_list = [None,]
+            torch.distributed.broadcast_object_list(best_params_list, src=0)
+            best_params = best_params_list[0]
+
         # use best config to run best result
         run_tokenizer_model_args = copy.deepcopy(tokenizer_model_args)
         for key in best_params.keys():
-            run_tokenizer_model_args.__setattr__(key, best_params[key])
+            setattr(run_tokenizer_model_args, key, best_params[key])
         run_data_args = copy.deepcopy(data_args)
         run_training_args = copy.deepcopy(training_args)
         run_training_args.do_train = True
@@ -978,15 +1003,18 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
             run_data_args,
             run_training_args,
             num_times=training_args.run_times,
-            mean_results=True)
+            mean_results=True,
+        )
 
-        # save best eval metrics and all config
-        all_config_and_eval_metrics = combine_dict(mean_eval_result, best_config)
-        all_config_and_eval_metrics['tuner'] = False # modify tuner to False for running
-        save_dir = training_args.tuner_results_dir
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        save_yaml_args(save_dir+'conf.yaml', all_config_and_eval_metrics)
+        # save best eval metrics and all config at Rank 0
+        with training_args.main_process_first(local=True, desc='save best eval metrics and all config'):
+            if mean_eval_result is not None:
+                all_config_and_eval_metrics = combine_dict(mean_eval_result, best_config)
+                all_config_and_eval_metrics['tuner'] = False # modify tuner to False for running
+                save_dir = training_args.tuner_results_dir
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                save_yaml_args(save_dir+'conf.yaml', all_config_and_eval_metrics)
 
     # run once
     eval_metrics = None
@@ -1010,6 +1038,15 @@ def trainer_one_args(tokenizer_model_args: TokenizerAndModelArguments,
 
     return eval_metrics, combine_dict(config.to_dict(), asdict(data_args), training_args.to_dict())
 
+def mean_std_listdict(listdict: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    metrics_df = pd.DataFrame(listdict)
+    mean_ = metrics_df.mean(axis=0).to_dict()
+    std_ = metrics_df.std(axis=0).to_dict()
+    mean_std_metric_dict = {}
+    for k in mean_.keys():
+        mean_std_metric_dict[k] = {'mean': mean_[k], 'std': std_[k]}
+    return mean_std_metric_dict
+
 def train_times(tokenizer_model_args: TokenizerAndModelArguments,
                 data_args: DataTrainingArguments,
                 training_args: TrainingArguments,
@@ -1020,20 +1057,19 @@ def train_times(tokenizer_model_args: TokenizerAndModelArguments,
     config = None
     for idx in range(num_times):
         # seed
-        transformers.enable_full_determinism(training_args.seed + idx * 100)
-        if idx > 0: # manual set new logging_dir
+        # seed = training_args.seed + (training_args.process_index * num_times + idx) * 100
+        seed = training_args.seed + idx * 100
+        transformers.enable_full_determinism(seed)
+        # manual set new logging_dir at rank 0
+        # because non-main processes will not log
+        if idx > 0:
             training_args.logging_dir = os.path.expanduser(os.path.join(training_args.output_dir, default_logdir()))
         eval_metrics, config = trainer_one_args(tokenizer_model_args, data_args, training_args)
         repeat_eval_metrics.append(eval_metrics)
 
     if repeat_eval_metrics[0] is not None:
-        if mean_results and num_times > 1:
-            eval_metrics_df = pd.DataFrame(repeat_eval_metrics)
-            mean_ = eval_metrics_df.mean(axis=0).to_dict()
-            std_ = eval_metrics_df.std(axis=0).to_dict()
-            mean_std_metric_dict = {}
-            for k in mean_.keys():
-                mean_std_metric_dict[k] = {'mean': mean_[k], 'std': std_[k]}
+        if mean_results and len(repeat_eval_metrics) > 1:
+            mean_std_metric_dict = mean_std_listdict(listdict=repeat_eval_metrics)
             return mean_std_metric_dict, config
         else:
             return listdict_map_dictlist(listdict=repeat_eval_metrics, dictlist=None), config
@@ -1075,9 +1111,10 @@ def main():
         else:
             all_config_and_eval_metrics = combine_dict(mean_eval_result, config)
             save_dir = training_args.run_results_dir
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            save_yaml_args(save_dir + 'conf.yaml', all_config_and_eval_metrics)
+            with training_args.main_process_first(local=True, desc='save run results'):
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                save_yaml_args(save_dir + 'conf.yaml', all_config_and_eval_metrics)
 
 if __name__ == '__main__':
     main()
